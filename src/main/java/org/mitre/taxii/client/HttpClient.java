@@ -23,10 +23,19 @@ ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES
 LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND
 ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
 (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
-SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE. 
- */
+SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+*/
 
+import java.io.BufferedReader;
+import java.io.BufferedWriter;
+import java.io.EOFException;
+import java.io.File;
+import java.io.FileReader;
+import java.io.FileWriter;
 import java.io.IOException;
+import java.io.InputStream;
+import java.io.InputStreamReader;
+import java.io.Reader;
 import java.io.StringReader;
 import java.io.StringWriter;
 import java.io.UnsupportedEncodingException;
@@ -35,6 +44,8 @@ import java.util.Arrays;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map.Entry;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 import java.util.Set;
 
 import javax.net.ssl.SSLException;
@@ -68,7 +79,7 @@ import org.mitre.taxii.messages.TaxiiXml;
  * <li> An Apache Components CloseableHttpClient, {@link HttpClient#getHttpClient} This manages the HTTP protocol interaction.
  * The default constructor will create a simple, pre-configured HttpClient based
  * on the system properties. If you wish to use an HttpClient configured to use
- * an explicit proxy, or a security certificate, you will need to construct and 
+ * an explicit proxy, or a security certificate, you will need to construct and
  * configure it, then apply it to the TAXII HttpClient.
  * </li>
  * 
@@ -83,7 +94,7 @@ import org.mitre.taxii.messages.TaxiiXml;
  * <h3>Usage example</h3>
  <pre>
     HttpClient taxiiClient = new HttpClient();
-        
+
     final String serverUrl = "http://127.0.0.1:8080/services/discovery/";
 
     // Prepare the message to send.
@@ -93,7 +104,7 @@ import org.mitre.taxii.messages.TaxiiXml;
     // Call the service
     Object responseObj = taxiiClient.callTaxiiService(new URI(serverUrl), dr);
  </pre>
- 
+
  * @author jasenj1
  */
 public class HttpClient {
@@ -119,14 +130,14 @@ public class HttpClient {
     private CloseableHttpClient httpClient;
 
     // Structures to handle multiple versions of TAXII
-    
+
     /**
      * The map of TAXII versions to TaxiiXml objects that process that version.
      * Each TAXII version may have one and only one TaxiiXml to handle TAXII
      * messages of that version.
      */
     private final HashMap<String, TaxiiXml> taxiiXmlMap = new HashMap<>();
-    /** 
+    /**
      * Provides a link from package names to TAXII versions.
      * The TaxiiXml object that handles a version of TAXII must be in its own
      * package. e.g. com.example.xml10 and com.example.xml11.
@@ -158,7 +169,7 @@ public class HttpClient {
     public HttpClient(CloseableHttpClient httpClient) {
         this.httpClient = httpClient;
 
-        // By default, create a taxiiXmlMap that understands basic TAXII 1.0 and 1.1        
+        // By default, create a taxiiXmlMap that understands basic TAXII 1.0 and 1.1
         org.mitre.taxii.messages.xml10.TaxiiXmlFactory txf10 = new org.mitre.taxii.messages.xml10.TaxiiXmlFactory();
         org.mitre.taxii.messages.xml11.TaxiiXmlFactory txf11 = new org.mitre.taxii.messages.xml11.TaxiiXmlFactory();
 
@@ -201,9 +212,9 @@ public class HttpClient {
      * @throws IOException
      */
     public Object callTaxiiService(final URI uri, final Object message) throws JAXBException, UnsupportedEncodingException, IOException {
-    	return callTaxiiService(uri,message,null);
+        return callTaxiiService(uri,message,null);
     }
-    
+
     /**
      * Send a TAXII message to an endpoint. The version of the message will be
      * determined by its package name, which must match the package name of a {@link org.mitre.taxii.messages.TaxiiXml}
@@ -253,7 +264,7 @@ public class HttpClient {
         // Make the call to the server.
         try {
             // The TAXII messages must be sent as POST.
-            HttpPost postRequest = new HttpPost(uri);            
+            HttpPost postRequest = new HttpPost(uri);
 
             // Set the required HTTP Headers.
             postRequest.addHeader("User-Agent", "java-taxii.httpclient");
@@ -265,7 +276,7 @@ public class HttpClient {
             }
             postRequest.addHeader(HEADER_X_TAXII_CONTENT_TYPE, msgVersion);
             postRequest.addHeader(HEADER_X_TAXII_SERVICES, taxiiXml.getServiceVersion());
-            
+
             // validate the scheme (HTTP or HTTPS)
             if (null == postRequest.getURI().getScheme()) {
                 throw new IOException("Invalid service URI.");
@@ -338,8 +349,251 @@ public class HttpClient {
     }
 
     /**
+     * Send a TAXII message to an endpoint. The version of the message will be
+     * determined by its package name, which must match the package name of a {@link org.mitre.taxii.messages.TaxiiXml}
+     * object in the taxiiXmlMap. If an appropriate message handler cannot be found,
+     * an exception is thrown.
+     *
+     * NOTE: It is expected that the response received will match the version of
+     * the message sent. The TAXII specification allows setting multiple values
+     * in the "x-taxii-accept" header. This library only sets and sends the
+     * version of the message being sent.
+     *
+     * This call will split the feed into content blocks and store the XML in files
+     *  of a specified size in specified directory.
+     *
+     * @param uri The address of the endpoint to send the message to
+     * @param message The message to send.
+     * @param context The context to send with the response (to allow preemptive authentication)
+     * @param dir location of where to store downloaded XML
+     * @param blockSize size of XML files that will be created in directory that was passed in parameter 'dir'.
+     * @return resultObj
+     *              "null" if download was successful
+     *              TAXII response object in case of error.
+     * @throws Exception
+     */
+    public Object callTaxiiService(final URI uri, final Object message, HttpClientContext context, String dir, int blockSize) throws Exception {
+
+        // Figure out the version of the message.
+        String msgPackage = message.getClass().getPackage().getName();
+
+        // Get the appropriate TAXII message environment.
+        String msgVersion = packageToVersionMap.get(msgPackage);
+        TaxiiXml taxiiXml = taxiiXmlMap.get(msgVersion);
+
+
+        // Couldn't find a handler for the message.
+         if (null == taxiiXml) {
+            throw new JAXBException("Message is unknown TAXII version.");
+        }
+
+        // we now have a TaxiiXml that knows how to handle the message we receieved.
+        Object resultObj = null;
+
+        // Make the call to the server.
+        try {
+            // The TAXII messages must be sent as POST.
+            HttpPost postRequest = new HttpPost(uri);
+
+            // Set the required HTTP Headers.
+            postRequest.addHeader("User-Agent", "java-taxii.httpclient");
+            postRequest.addHeader(HEADER_CONTENT_TYPE, "application/xml");
+            postRequest.addHeader(HEADER_ACCEPT, "application/xml");
+            if (taxiiXml.isRequestMessage(message)) {
+                // Should be present for requests. Should NOT be present for responses.
+                postRequest.addHeader(HEADER_X_TAXII_ACCEPT, msgVersion);
+            }
+            postRequest.addHeader(HEADER_X_TAXII_CONTENT_TYPE, msgVersion);
+            postRequest.addHeader(HEADER_X_TAXII_SERVICES, taxiiXml.getServiceVersion());
+
+            // validate the scheme (HTTP or HTTPS)
+            if (null == postRequest.getURI().getScheme()) {
+                throw new IOException("Invalid service URI.");
+            } else if (!(postRequest.getURI().getScheme().toLowerCase().equals(SCHEME_HTTP) ||
+                    postRequest.getURI().getScheme().toLowerCase().equals(SCHEME_HTTPS))) {
+                throw new IOException("Invalid service URI. Only 'http' or 'https' are supported");
+            }
+
+            if (postRequest.getURI().getScheme().equals(SCHEME_HTTPS)) {
+                postRequest.addHeader(HEADER_X_TAXII_PROTOCOL, Versions.VID_TAXII_HTTPS_10);
+            } else {
+                postRequest.addHeader(HEADER_X_TAXII_PROTOCOL, Versions.VID_TAXII_HTTP_10);
+            }
+
+            // Serialize the message.
+            final Marshaller m = taxiiXml.createMarshaller(false); // Don't pretty print.
+            m.setProperty(Marshaller.JAXB_FRAGMENT, true); // Don't generate xml declaration.
+
+            // Render the JAXB object to a string.
+            final StringWriter sw = new StringWriter();
+            m.marshal(message, sw);
+            String requestStr = sw.toString();
+
+            // Put the XML string in an entiny for the Request.
+            StringEntity reqEntity = new StringEntity(requestStr);
+            postRequest.setEntity(reqEntity);
+
+            // Do the request
+            try (CloseableHttpResponse response = httpClient.execute(postRequest,context)) {
+
+                // Check that we got the TAXII Content Type we're expecting.
+                Header[] headers = response.getHeaders(HEADER_X_TAXII_CONTENT_TYPE);
+                List<Header> headerList = Arrays.asList(headers);
+
+                boolean contentFound = false;
+                for (Header header : headerList) {
+                    if (msgVersion.equals(header.getValue())) {
+                        contentFound = true;
+                        break;
+                    }
+                }
+
+                if (!contentFound) { // Response is not a TAXII Message we understand.
+                    // go create a TAXII status message based on the headers.
+                    resultObj = taxiiXml.getResponseHandler().buildStatusCodeStatusMessage(response, message);
+                } else { // We should know how to handle the response.
+                    // Extract the response body.
+                    HttpEntity respEntity = response.getEntity();
+                    if(respEntity != null){
+                        try {
+                            InputStream input = respEntity.getContent();
+                            dumpContentBlocks(input, dir, blockSize);
+                        } catch (IOException | IllegalStateException e) {
+                            throw new JAXBException("Unable to establish an InputStream with TAXII server.");
+                        }
+                    }
+
+                    // Attempt to parse the response into a JAXB object regardless of the
+                    // HTTP status code.
+                }
+            } catch (SSLException ex) {
+                resultObj = taxiiXml.getResponseHandler().buildSSLErrorStatusMessage(ex, message);
+            }
+        } finally {
+            httpClient.close();
+        }
+        //return resultObj;
+        return resultObj;
+    }
+
+    private void dumpContentBlocks(InputStream input, String dir, final int blockSize) throws Exception{
+        Pattern cbOpen = Pattern.compile("(?i)<\\s*taxii_{0,1}\\d*:content_block\\s*");
+        Pattern cbClose = Pattern.compile("(?i)<\\s*/taxii_{0,1}\\d*:content_block\\s*>");
+        Pattern prOpen = Pattern.compile("(?i)<(\\s*taxii_{0,1}\\d*:poll_response)[^>]*>");
+
+        final int bufferSize = 8192;
+        final char[] buffer = new char[bufferSize];
+        Reader in = new InputStreamReader(input, "UTF-8");
+
+        StringBuilder out = new StringBuilder();
+        boolean writeOpen = false;
+        int blockStart = 0;
+        int contentSize = 0;
+        int bytesRead = -1;
+        String pollRespOpen;
+        String pollRespClose;
+
+        bytesRead = in.read(buffer, 0, buffer.length);
+        Matcher match = prOpen.matcher(new String(buffer));
+
+        //Look for PollResponse tag
+        if(match.find()){
+            pollRespOpen = match.group(0)+"\n";
+            pollRespClose = "</" + match.group(1) + ">\n";
+        }
+        else {
+            //error not a taxii response.
+            throw new IllegalArgumentException("Invalid response: no TAXII XML found.");
+        }
+
+        while (bytesRead >= 0){
+            match = cbOpen.matcher(new String(buffer));
+            while (match.find()){
+                //This is a second match within buffer. Everything until this point is part of a previous block.
+                if (writeOpen){//removing -1 from next 3 lines
+                    //System.out.println("Block End: " + (match.start() - 1));
+                    if(match.start() > 0)
+                        out.append(buffer, blockStart, match.start() - blockStart - 1);
+                    contentSize += match.start() - blockStart - 1;
+                    if(contentSize >= blockSize){
+                        out.append(pollRespClose);
+                        writeToFile(dir, out.toString());
+                        contentSize = 0;
+                        out = new StringBuilder();
+                        out.append(pollRespOpen);
+                    }
+                    blockStart = match.start();
+                    //System.out.println("Block Start: " + (match.start()));
+                //this is a first match in buffer. Remember start position and move on
+                } else {
+                    writeOpen = true;
+                    blockStart = match.start();
+                    out.append(pollRespOpen);
+                    //System.out.println("Block Start: " + match.start());
+                }
+            }
+            //Buffer did not contain the end of block. Dump content starting from blockStart until bytesRead
+            if(writeOpen){
+                contentSize += bytesRead - blockStart;
+                //System.out.println("buf:"+buffer.length+" start:"+blockStart+" endIndex:"+(bytesRead-1));
+                out.append(buffer, blockStart, bytesRead-blockStart);
+                blockStart = 0;
+            }
+            Arrays.fill(buffer, '\0');
+            bytesRead = in.read(buffer, 0, buffer.length);
+        }
+        // We reached the end of stream. Truncate bytes after the end of content block. (some taxii tags)
+        if(writeOpen){
+            match = cbClose.matcher(out.toString());
+            int end = 0;
+            //find the closing ContentBlock tag for current data block
+            while(match.find()){
+                end = match.end();
+            }
+            if(end == 0){
+              //Error: stream did not contain end of block.
+                throw new EOFException("Stream terminated before the end of block");
+            }
+            out.delete(end, out.length());
+            out.append(pollRespClose);
+            writeToFile(dir, out.toString());
+        } else {
+            //No data in this time frame. Input Stream contained PollResponse tag with no ContentBlock.
+        }
+        in.close();
+    }
+
+    public void writeToFile(String path, String data) throws IOException{
+        int writeBM = 0;
+        File destDir = new File(path);
+        String wBookmark = path + "/bookmark.write";
+
+        if (!destDir.exists())
+            destDir.mkdir();
+
+        //attempt to get writer bookmark
+        if (new File(wBookmark).exists()){
+            BufferedReader reader = new BufferedReader (new FileReader(wBookmark));
+            String line = reader.readLine();
+            writeBM = Integer.parseInt(line);
+            reader.close();
+        }
+
+        //write the file
+        String file = path + "/block_" + writeBM + ".xml";
+        BufferedWriter writer = new BufferedWriter( new FileWriter(file));
+        writer.write(data);
+        writer.close();
+
+        //update write bookmark
+        writer = new BufferedWriter( new FileWriter(wBookmark));
+        writer.write(String.valueOf(++writeBM));
+        writer.close();
+    }
+
+    /**
      * Populate the map that maps package names to TAXII versions.
-     * The package of the TaxiiXml classes is used to determine which version of 
+     * The package of the TaxiiXml classes is used to determine which version of
      * TAXII they understand.
      */
     private void populatePackageToVersionMap() {
@@ -352,9 +606,9 @@ public class HttpClient {
             packageToVersionMap.put(packageName, version);
         }
     }
-            
+
     // ========= Getters and Setters. ==============
-    
+
     /**
      * Get the Apache Components HTTP Client in use by this object.
      *
@@ -369,7 +623,7 @@ public class HttpClient {
      * This method is very useful when needing an HttpClient configured to use a
      * proxy or SSL certificates or other authorization technique.
      * 
-     * @param httpclient 
+     * @param httpclient
      */
     public void setHttpclient(CloseableHttpClient httpclient) {
         this.httpClient = httpclient;
@@ -390,5 +644,5 @@ public class HttpClient {
     public TaxiiXml getVersionHandler(String key) {
         return taxiiXmlMap.get(key);
     }
-    
+
 }
